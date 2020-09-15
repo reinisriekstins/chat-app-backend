@@ -24,7 +24,7 @@ const wsServer = new WebSocket.Server({ server: httpServer });
 // I initially intended to implement the observer pattern
 // on these arrays and make the clients subscribe to their
 // changes, but eventually went with a more simple approach
-// so these arrays aren't ACTUALLY used anywhere, but I 
+// so these arrays aren't ACTUALLY used anywhere, but I
 // decided to keep them just in case.
 const users = [];
 const chatEvents = [];
@@ -71,8 +71,27 @@ const ChatEventTypes = {
   USER_CONNECTION_CLOSED: "USER_CONNECTION_CLOSED",
 };
 
-wsServer.on("connection", (ws) => {
-  ws.on("close", (code, reason) => {
+function sendMsg(clientConnection, msgObj) {
+  const msgString = JSON.stringify(msgObj);
+
+  logger.info({
+    msg: "Sending message to client",
+    targetUsername: clientConnection.username,
+    wsMsg: msgString,
+  });
+
+  clientConnection.send(msgString);
+}
+
+const createConnectionCloseHandler = (ws, eventListenerRemoveMap) => {
+  return function handleClose(code, reason) {
+    logger.info({
+      msg: "Closing connection",
+      code,
+      reason,
+      username: ws.username,
+    });
+
     if (ws.username) {
       const user = users.find((u) => u.username === ws.username);
       users.splice(users.indexOf(user), 1);
@@ -86,229 +105,231 @@ wsServer.on("connection", (ws) => {
       chatEvents.push(disconnectEvt);
       wsServer.clients.forEach((client) => {
         if (client.username) {
-          client.send(
-            JSON.stringify({
-              type: ServerMessageTypes.USER_CONNECTION_CLOSED,
-              payload: disconnectEvt,
-            })
-          );
+          sendMsg(client, {
+            type: ServerMessageTypes.USER_CONNECTION_CLOSED,
+            payload: disconnectEvt,
+          });
         }
-      });
-
-      logger.info({
-        msg: "Connection closed",
-        code,
-        reason,
-        username: user.username,
       });
     }
+
+    // I don't know if the "ws" module provides an automatic
+    // mechanism for removing event listeners from closed connections,
+    // but I didn't find anything about it in the docs
+    // and therefore as a precaution manually implemented a mechanism to remove them,
+    // as this might cause a memory leak in a production app
+    Object.entries(eventListenerRemoveMap).forEach(([eventType, listener]) => {
+      ws.removeEventListener(eventType, listener);
+    });
+    // remove self
+    ws.removeEventListener("close", handleClose);
+  };
+};
+
+const createMsgHandler = (ws) => (message) => {
+  logger.info({
+    msg: "Received msg from client",
+    sourceUsername: ws.username,
+    wsMsg: message,
   });
 
-  ws.on("message", (message) => {
-    logger.info({ receivedMsg: message });
-    // TODO: try to break this
-    // (I'm not 100% sure this validation is sufficiently secure)
-    const { type, payload = {} } = (() => {
-      try {
-        return JSON.parse(message);
-      } catch (err) {
-        logger.warn("Invalid msg");
-        ws.send(
-          JSON.stringify({
-            type: ServerMessageTypes.ERROR,
-            error: {
-              type: ErrorTypes.INVALID_MSG_FORMAT,
-              message: "Invalid message format",
-            },
-          })
-        );
-      }
-    })();
-
-
-    if (type === ClientMessageTypes.JOIN_CHAT) {
-      const { username } = payload;
-      if (!username) {
-        ws.send(
-          JSON.stringify({
-            type: ServerMessageTypes.ERROR,
-            error: {
-              type: ErrorTypes.USERNAME_REQUIRED,
-              message: "Username is required",
-            },
-          })
-        );
-        return;
-      }
-      if (typeof username !== "string" || username.length >= 30) {
-        ws.send(
-          JSON.stringify({
-            type: ServerMessageTypes.ERROR,
-            error: {
-              type: ErrorTypes.INVALID_USERNAME,
-              message: "Invalid username",
-            },
-          })
-        );
-        return;
-      }
-      if (users.find((user) => user.username === username)) {
-        ws.send(
-          JSON.stringify({
-            type: ServerMessageTypes.ERROR,
-            error: {
-              type: ErrorTypes.USERNAME_EXISTS,
-              message: `Username "${username}" already exists`,
-            },
-          })
-        );
-        return;
-      }
-
-      const now = new Date();
-      users.push({
-        username,
-        joinedAt: now,
-        lastActivity: now,
+  const msgObj = (() => {
+    try {
+      return JSON.parse(message);
+    } catch (err) {
+      logger.warn({
+        msg: "Failed to parse message",
+        wsMsg: message,
+        username: ws.username,
       });
-
-      const joinEvent = {
-        type: ChatEventTypes.USER_JOINED,
-        occurredAt: now,
-        sourceUsername: username,
-      };
-      chatEvents.push(joinEvent);
-      wsServer.clients.forEach((client) => {
-        if (client.username) {
-          client.send(
-            JSON.stringify({
-              type: ServerMessageTypes.USER_JOINED,
-              payload: joinEvent,
-            })
-          );
-        }
-      });
-
-      // since there is no mention of needing
-      // persistent authentication, I'm going to use this
-      // kinda hacky solution of just assigning the username
-      // to the connection object
-      ws.username = username;
-      ws.send(
-        JSON.stringify({
-          type: ServerMessageTypes.JOIN_SUCCESS,
-          payload: { user: { username } },
-        })
-      );
-    } else if (type === ClientMessageTypes.SUBMIT_CHAT_MESSAGE) {
-      if (
-        !ws.username &&
-        !users.find((user) => user.username === ws.username)
-      ) {
-        ws.send(
-          JSON.stringify({
-            type: ServerMessageTypes.ERROR,
-            error: {
-              type: ErrorTypes.AUTH_FAILED,
-              message: "Authorization failed",
-            },
-          })
-        );
-        return;
-      }
-
-      const { message } = payload;
-      if (
-        !message ||
-        typeof message !== "string" ||
-        (message && message.length > 500)
-      ) {
-        ws.send(
-          JSON.stringify({
-            type: ServerMessageTypes.ERROR,
-            error: {
-              type: ErrorTypes.INVALID_CHAT_MSG,
-              message: "Invalid chat message",
-            },
-          })
-        );
-        return;
-      }
-
-      const now = new Date();
-      const chatMsg = {
-        type: ChatEventTypes.MSG_ADDED,
-        occurredAt: now,
-        sourceUsername: ws.username,
-        message,
-      };
-      chatEvents.push(chatMsg);
-
-      // broadcast to all logged in clients
-      // (including the sender)
-      wsServer.clients.forEach((client) => {
-        if (client.username) {
-          client.send(
-            JSON.stringify({
-              type: ServerMessageTypes.CHAT_MSG_ADDED,
-              payload: chatMsg,
-            })
-          );
-        }
-      });
-      const user = users.find((user) => user.username === ws.username);
-      user.lastActivity = now;
-    } else if (type === ClientMessageTypes.LOGOUT) {
-      if (!ws.username) {
-        ws.send(
-          JSON.stringify({
-            type: ServerMessageTypes.ERROR,
-            error: {
-              type: ErrorTypes.AUTH_FAILED,
-              message: "Authentication failed",
-            },
-          })
-        );
-        return;
-      }
-      const user = users.find((user) => user.username === ws.username);
-      users.splice(users.indexOf(user), 1);
-      ws.username = null;
-
-      const logoutEvent = {
-        type: ChatEventTypes.USER_LOGOUT,
-        occurredAt: new Date(),
-        sourceUsername: user.username,
-      };
-      chatEvents.push(logoutEvent);
-      wsServer.clients.forEach((client) => {
-        if (client.username) {
-          client.send(
-            JSON.stringify({
-              type: ServerMessageTypes.USER_LOGOUT,
-              payload: logoutEvent,
-            })
-          );
-        }
-      });
-      ws.send(
-        JSON.stringify({
-          type: ServerMessageTypes.LOGOUT_SUCCESS,
-        })
-      );
-    } else {
-      logger.warn('Invalid msg type');
-      ws.send(
-        JSON.stringify({
-          type: ServerMessageTypes.ERROR,
-          error: {
-            type: ErrorTypes.INVALID_MSG_TYPE,
-            message: "Invalid message type",
-          },
-        })
-      );
     }
+  })();
+
+  // if failed to parse message, don't do anything further
+  if (!msgObj) {
+    return;
+  }
+
+  // numbers, strings and arrays can also be parsed from JSON,
+  // so we need to validate, that the supposed msgObj isn't one
+  // of those data types
+  if (typeof msgObj !== "object" || msgObj instanceof Array) {
+    logger.warn({
+      msg: "Invalid msg object data type",
+      value: msgObj instanceof Array ? "array" : typeof msgObj,
+      wsMsg: message,
+      username: ws.username,
+    });
+    return;
+  }
+
+  const { type, payload } = msgObj;
+  if (type === ClientMessageTypes.JOIN_CHAT) {
+    const { username } = payload;
+    if (!username) {
+      sendMsg(ws, {
+        type: ServerMessageTypes.ERROR,
+        error: {
+          type: ErrorTypes.USERNAME_REQUIRED,
+          message: "Username is required",
+        },
+      });
+      return;
+    }
+    if (typeof username !== "string" || username.length >= 30) {
+      sendMsg(ws, {
+        type: ServerMessageTypes.ERROR,
+        error: {
+          type: ErrorTypes.INVALID_USERNAME,
+          message: "Invalid username",
+        },
+      });
+      return;
+    }
+    if (users.find((user) => user.username === username)) {
+      sendMsg(ws, {
+        type: ServerMessageTypes.ERROR,
+        error: {
+          type: ErrorTypes.USERNAME_EXISTS,
+          message: `Username "${username}" already exists`,
+        },
+      });
+      return;
+    }
+
+    const now = new Date();
+    users.push({
+      username,
+      joinedAt: now,
+      lastActivity: now,
+    });
+
+    const joinEvent = {
+      type: ChatEventTypes.USER_JOINED,
+      occurredAt: now,
+      sourceUsername: username,
+    };
+    chatEvents.push(joinEvent);
+    wsServer.clients.forEach((client) => {
+      if (client.username) {
+        sendMsg(client, {
+          type: ServerMessageTypes.USER_JOINED,
+          payload: joinEvent,
+        });
+      }
+    });
+
+    // since there is no mention of needing
+    // persistent authentication, I'm going to use this
+    // kinda hacky solution of just assigning the username
+    // to the connection object
+    ws.username = username;
+    sendMsg(ws, {
+      type: ServerMessageTypes.JOIN_SUCCESS,
+      payload: { user: { username } },
+    });
+  } else if (type === ClientMessageTypes.SUBMIT_CHAT_MESSAGE) {
+    if (!ws.username && !users.find((user) => user.username === ws.username)) {
+      sendMsg(ws, {
+        type: ServerMessageTypes.ERROR,
+        error: {
+          type: ErrorTypes.AUTH_FAILED,
+          message: "Failed to authenticate",
+        },
+      });
+      return;
+    }
+
+    const { message } = payload;
+    if (
+      !message ||
+      typeof message !== "string" ||
+      (message && message.length > 500)
+    ) {
+      sendMsg(ws, {
+        type: ServerMessageTypes.ERROR,
+        error: {
+          type: ErrorTypes.INVALID_CHAT_MSG,
+          message: "Invalid chat message",
+        },
+      });
+      return;
+    }
+
+    const now = new Date();
+    const chatMsg = {
+      type: ChatEventTypes.MSG_ADDED,
+      occurredAt: now,
+      sourceUsername: ws.username,
+      message,
+    };
+    chatEvents.push(chatMsg);
+
+    // broadcast to all logged in clients
+    // (including the sender)
+    wsServer.clients.forEach((client) => {
+      if (client.username) {
+        sendMsg(client, {
+          type: ServerMessageTypes.CHAT_MSG_ADDED,
+          payload: chatMsg,
+        });
+      }
+    });
+    const user = users.find((user) => user.username === ws.username);
+    user.lastActivity = now;
+  } else if (type === ClientMessageTypes.LOGOUT) {
+    if (!ws.username) {
+      sendMsg(ws, {
+        type: ServerMessageTypes.ERROR,
+        error: {
+          type: ErrorTypes.AUTH_FAILED,
+          message: "Failed to authenticate",
+        },
+      });
+      return;
+    }
+    const user = users.find((user) => user.username === ws.username);
+    users.splice(users.indexOf(user), 1);
+    ws.username = null;
+
+    const logoutEvent = {
+      type: ChatEventTypes.USER_LOGOUT,
+      occurredAt: new Date(),
+      sourceUsername: user.username,
+    };
+    chatEvents.push(logoutEvent);
+    wsServer.clients.forEach((client) => {
+      if (client.username) {
+        sendMsg(client, {
+          type: ServerMessageTypes.USER_LOGOUT,
+          payload: logoutEvent,
+        });
+      }
+    });
+    sendMsg(ws, {
+      type: ServerMessageTypes.LOGOUT_SUCCESS,
+    });
+  } else {
+    sendMsg(ws, {
+      type: ServerMessageTypes.ERROR,
+      error: {
+        type: ErrorTypes.INVALID_MSG_TYPE,
+        message: `Invalid message type property: ${type}`,
+      },
+    });
+  }
+};
+
+wsServer.on("connection", (ws) => {
+  logger.info("New connection created");
+
+  const handleMsg = createMsgHandler(ws);
+  const handleClose = createConnectionCloseHandler(ws, {
+    message: handleMsg,
   });
+
+  ws.on("message", handleMsg);
+  ws.on("close", handleClose);
 });
 
 // Disconnect users due to inactivity.
@@ -330,11 +351,9 @@ const disconnectTaskId = setInterval(() => {
       inactiveUsers.find((u) => u.username === client.username)
     ) {
       client.username = null;
-      client.send(
-        JSON.stringify({
-          type: ServerMessageTypes.LOGOUT_DUE_TO_INACTIVITY,
-        })
-      );
+      sendMsg(client, {
+        type: ServerMessageTypes.LOGOUT_DUE_TO_INACTIVITY,
+      });
     }
   });
 
@@ -353,12 +372,10 @@ const disconnectTaskId = setInterval(() => {
     // about this user's disconnect
     wsServer.clients.forEach((client) => {
       if (client.username) {
-        client.send(
-          JSON.stringify({
-            type: ServerMessageTypes.USER_LOGGED_OUT_DUE_TO_INACTIVITY,
-            payload: disconnectEvt,
-          })
-        );
+        sendMsg(client, {
+          type: ServerMessageTypes.USER_LOGGED_OUT_DUE_TO_INACTIVITY,
+          payload: disconnectEvt,
+        });
       }
     });
   });
@@ -376,7 +393,7 @@ httpServer.listen(port);
 
 // Terminate gracefully upon receiving SIGINT or SIGTERM signals
 const handleProcessExit = async (signal) => {
-  logger.info(signal);
+  logger.info({ msg: "Preparing to exit process", signal });
   clearInterval(disconnectTaskId);
 
   const wsSrvClosePromise = new Promise((resolve) => wsServer.close(resolve));
@@ -390,3 +407,11 @@ const handleProcessExit = async (signal) => {
 };
 process.on("SIGINT", handleProcessExit);
 process.on("SIGTERM", handleProcessExit);
+
+process.on("uncaughtException", (err) => {
+  logger.error({ msg: "Uncaught exception", err });
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  logger.error({ msg: "Unhandled promise rejection", reason, promise });
+});
